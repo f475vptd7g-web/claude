@@ -1,4 +1,4 @@
-//@version=5
+//@version=6
 indicator("Liquidity Sweep + Order Block + Rejection Block Signals", shorttitle="LS-OB-RB", overlay=true, max_boxes_count=500, max_labels_count=500, max_lines_count=200)
 
 // ============================================================================
@@ -85,12 +85,18 @@ if not na(pl)
     array.push(pivLowBars, bar_index - swingLen)
 
 // prune stale pivots
-while array.size(pivHighBars) > 0 and bar_index - array.get(pivHighBars, 0) > sweepLookback
-    array.shift(pivHighs)
-    array.shift(pivHighBars)
-while array.size(pivLowBars) > 0 and bar_index - array.get(pivLowBars, 0) > sweepLookback
-    array.shift(pivLows)
-    array.shift(pivLowBars)
+while array.size(pivHighBars) > 0
+    if bar_index - array.get(pivHighBars, 0) > sweepLookback
+        array.shift(pivHighs)
+        array.shift(pivHighBars)
+    else
+        break
+while array.size(pivLowBars) > 0
+    if bar_index - array.get(pivLowBars, 0) > sweepLookback
+        array.shift(pivLows)
+        array.shift(pivLowBars)
+    else
+        break
 
 // ============================================================================
 // LIQUIDITY SWEEP DETECTION
