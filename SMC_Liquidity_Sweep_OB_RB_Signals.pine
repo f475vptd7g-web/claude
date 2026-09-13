@@ -1,0 +1,305 @@
+//@version=5
+indicator("Liquidity Sweep + Order Block + Rejection Block Signals", shorttitle="LS-OB-RB Signals", overlay=true, max_boxes_count=500, max_labels_count=500, max_lines_count=200)
+
+// ============================================================================
+// TYPES
+// ============================================================================
+type Zone
+    box   b
+    float top
+    float bottom
+    int   createdBar
+    bool  touched = false
+    bool  isRB    = false
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+grpSwing = "Swing / Liquidity"
+swingLen      = input.int(5, "Swing Pivot Length", minval=1, group=grpSwing, tooltip="Bars left/right required to confirm a swing high/low")
+sweepLookback = input.int(80, "Max age of a pivot to remain valid liquidity (bars)", minval=5, group=grpSwing)
+
+grpZone = "Order Block / Rejection Block"
+atrLen        = input.int(14, "ATR Length", group=grpZone)
+impulseMult   = input.float(1.5, "Impulse candle size (x ATR)", minval=0.5, step=0.1, group=grpZone, tooltip="Candle body must exceed this multiple of ATR to count as an impulse leaving the zone")
+obSearchBack  = input.int(7, "OB search-back window (bars)", minval=1, maxval=20, group=grpZone)
+maxZones      = input.int(3, "Max active zones per side", minval=1, maxval=10, group=grpZone)
+zoneExtend    = input.int(40, "Zone box width (bars)", minval=5, group=grpZone)
+
+grpSig = "Signal Logic"
+setupTimeout      = input.int(60, "Setup timeout (bars)", minval=10, group=grpSig, tooltip="A sweep must lead to a completed signal within this many bars, or the setup is dropped")
+requireBullClose  = input.bool(true, "Require confirmation candle in trigger direction", group=grpSig)
+
+grpDisp = "Display"
+showTable   = input.bool(true, "Show Info Dashboard", group=grpDisp)
+tablePos    = input.string("top_right", "Dashboard Position", options=["top_right","top_left","bottom_right","bottom_left"], group=grpDisp)
+bullObCol   = input.color(color.new(color.teal, 75), "Bullish OB Color", group=grpDisp)
+bearObCol   = input.color(color.new(color.red, 75), "Bearish OB Color", group=grpDisp)
+bullRbCol   = input.color(color.new(color.lime, 85), "Bullish Rejection Block Color", group=grpDisp)
+bearRbCol   = input.color(color.new(color.orange, 85), "Bearish Rejection Block Color", group=grpDisp)
+showSweepMarks = input.bool(true, "Mark Liquidity Sweeps", group=grpDisp)
+
+// ============================================================================
+// STATE
+// ============================================================================
+var float[] pivHighs    = array.new_float()
+var int[]   pivHighBars = array.new_int()
+var float[] pivLows     = array.new_float()
+var int[]   pivLowBars  = array.new_int()
+
+var Zone[] bullZones = array.new<Zone>()
+var Zone[] bearZones = array.new<Zone>()
+
+var bool bullSetupActive = false
+var int  bullSetupBar    = na
+var bool bearSetupActive = false
+var int  bearSetupBar    = na
+
+var int buyCount  = 0
+var int sellCount = 0
+var int bullSweepCount = 0
+var int bearSweepCount = 0
+var string lastSignal = "None"
+var int lastSignalBar = na
+
+bool bullSweepEvent = false
+bool bearSweepEvent = false
+bool bullObEvent = false
+bool bearObEvent = false
+bool buySignal  = false
+bool sellSignal = false
+
+atrVal = ta.atr(atrLen)
+
+// ============================================================================
+// PIVOT DETECTION
+// ============================================================================
+ph = ta.pivothigh(high, swingLen, swingLen)
+pl = ta.pivotlow(low, swingLen, swingLen)
+
+if not na(ph)
+    array.push(pivHighs, ph)
+    array.push(pivHighBars, bar_index - swingLen)
+if not na(pl)
+    array.push(pivLows, pl)
+    array.push(pivLowBars, bar_index - swingLen)
+
+// prune stale pivots
+while array.size(pivHighBars) > 0 and bar_index - array.get(pivHighBars, 0) > sweepLookback
+    array.shift(pivHighs)
+    array.shift(pivHighBars)
+while array.size(pivLowBars) > 0 and bar_index - array.get(pivLowBars, 0) > sweepLookback
+    array.shift(pivLows)
+    array.shift(pivLowBars)
+
+// ============================================================================
+// LIQUIDITY SWEEP DETECTION
+// (wick trades through a prior swing point, candle closes back inside)
+// ============================================================================
+// Bearish-side liquidity swept (sell-side liquidity below swing lows) -> bullish setup
+if array.size(pivLows) > 0
+    for i = array.size(pivLows) - 1 to 0
+        plVal = array.get(pivLows, i)
+        if low < plVal and close > plVal
+            array.remove(pivLows, i)
+            array.remove(pivLowBars, i)
+            bullSweepEvent := true
+            bullSweepCount += 1
+            bullSetupActive := true
+            bullSetupBar := bar_index
+            // Rejection block: wick of the sweep candle itself
+            rbTop = math.min(open, close)
+            rbBot = low
+            rbBox = box.new(left=bar_index, top=rbTop, bottom=rbBot, right=bar_index + zoneExtend, border_color=color.lime, bgcolor=bullRbCol, extend=extend.none)
+            newZone = Zone.new(b=rbBox, top=rbTop, bottom=rbBot, createdBar=bar_index, touched=false, isRB=true)
+            array.push(bullZones, newZone)
+            if array.size(bullZones) > maxZones
+                oldZone = array.shift(bullZones)
+                box.delete(oldZone.b)
+            break
+
+// Bullish-side liquidity swept (buy-side liquidity above swing highs) -> bearish setup
+if array.size(pivHighs) > 0
+    for i = array.size(pivHighs) - 1 to 0
+        phVal = array.get(pivHighs, i)
+        if high > phVal and close < phVal
+            array.remove(pivHighs, i)
+            array.remove(pivHighBars, i)
+            bearSweepEvent := true
+            bearSweepCount += 1
+            bearSetupActive := true
+            bearSetupBar := bar_index
+            rbTop = high
+            rbBot = math.max(open, close)
+            rbBox = box.new(left=bar_index, top=rbTop, bottom=rbBot, right=bar_index + zoneExtend, border_color=color.orange, bgcolor=bearRbCol, extend=extend.none)
+            newZone = Zone.new(b=rbBox, top=rbTop, bottom=rbBot, createdBar=bar_index, touched=false, isRB=true)
+            array.push(bearZones, newZone)
+            if array.size(bearZones) > maxZones
+                oldZone = array.shift(bearZones)
+                box.delete(oldZone.b)
+            break
+
+if showSweepMarks and bullSweepEvent
+    label.new(bar_index, low, "SWEEP", style=label.style_label_up, color=color.new(color.lime, 30), textcolor=color.black, size=size.tiny)
+if showSweepMarks and bearSweepEvent
+    label.new(bar_index, high, "SWEEP", style=label.style_label_down, color=color.new(color.orange, 30), textcolor=color.black, size=size.tiny)
+
+// ============================================================================
+// ORDER BLOCK DETECTION
+// (last opposite candle before an impulsive move, while a setup is active)
+// ============================================================================
+bodySize = math.abs(close - open)
+isImpulseUp   = close > open and bodySize > impulseMult * atrVal
+isImpulseDown = close < open and bodySize > impulseMult * atrVal
+
+findOffset(isBull) =>
+    off = -1
+    if isBull
+        for i = 1 to obSearchBack
+            if close[i] < open[i]
+                off := i
+                break
+    else
+        for i = 1 to obSearchBack
+            if close[i] > open[i]
+                off := i
+                break
+    off
+
+if bullSetupActive and isImpulseUp and bar_index > bullSetupBar
+    off = findOffset(true)
+    if off >= 0
+        obTop = high[off]
+        obBot = low[off]
+        obBox = box.new(left=bar_index - off, top=obTop, bottom=obBot, right=bar_index + zoneExtend, border_color=color.teal, bgcolor=bullObCol, extend=extend.none)
+        obZone = Zone.new(b=obBox, top=obTop, bottom=obBot, createdBar=bar_index, touched=false, isRB=false)
+        array.push(bullZones, obZone)
+        if array.size(bullZones) > maxZones
+            oldZone = array.shift(bullZones)
+            box.delete(oldZone.b)
+        bullObEvent := true
+
+if bearSetupActive and isImpulseDown and bar_index > bearSetupBar
+    off = findOffset(false)
+    if off >= 0
+        obTop = high[off]
+        obBot = low[off]
+        obBox = box.new(left=bar_index - off, top=obTop, bottom=obBot, right=bar_index + zoneExtend, border_color=color.red, bgcolor=bearObCol, extend=extend.none)
+        obZone = Zone.new(b=obBox, top=obTop, bottom=obBot, createdBar=bar_index, touched=false, isRB=false)
+        array.push(bearZones, obZone)
+        if array.size(bearZones) > maxZones
+            oldZone = array.shift(bearZones)
+            box.delete(oldZone.b)
+        bearObEvent := true
+
+// ============================================================================
+// ZONE MONITORING -> BUY / SELL SIGNAL WHEN SEQUENCE COMPLETES
+// (sweep happened -> zone exists -> price retests zone -> confirmation candle)
+// ============================================================================
+if array.size(bullZones) > 0
+    for i = array.size(bullZones) - 1 to 0
+        z = array.get(bullZones, i)
+        if bar_index > z.createdBar
+            if low <= z.top and high >= z.bottom
+                z.touched := true
+            if close < z.bottom
+                box.delete(z.b)
+                array.remove(bullZones, i)
+            else if z.touched and close > z.top and (not requireBullClose or close > open)
+                buySignal := true
+                box.delete(z.b)
+                array.remove(bullZones, i)
+
+if array.size(bearZones) > 0
+    for i = array.size(bearZones) - 1 to 0
+        z = array.get(bearZones, i)
+        if bar_index > z.createdBar
+            if high >= z.bottom and low <= z.top
+                z.touched := true
+            if close > z.top
+                box.delete(z.b)
+                array.remove(bearZones, i)
+            else if z.touched and close < z.bottom and (not requireBullClose or close < open)
+                sellSignal := true
+                box.delete(z.b)
+                array.remove(bearZones, i)
+
+if buySignal
+    buyCount += 1
+    bullSetupActive := false
+    lastSignal := "BUY"
+    lastSignalBar := bar_index
+    // clear any remaining bull zones from this completed setup
+    if array.size(bullZones) > 0
+        for i = array.size(bullZones) - 1 to 0
+            zr = array.get(bullZones, i)
+            box.delete(zr.b)
+            array.remove(bullZones, i)
+    label.new(bar_index, low - atrVal * 0.5, "BUY", style=label.style_label_up, color=color.new(color.green, 10), textcolor=color.white, size=size.small)
+
+if sellSignal
+    sellCount += 1
+    bearSetupActive := false
+    lastSignal := "SELL"
+    lastSignalBar := bar_index
+    if array.size(bearZones) > 0
+        for i = array.size(bearZones) - 1 to 0
+            zr = array.get(bearZones, i)
+            box.delete(zr.b)
+            array.remove(bearZones, i)
+    label.new(bar_index, high + atrVal * 0.5, "SELL", style=label.style_label_down, color=color.new(color.red, 10), textcolor=color.white, size=size.small)
+
+// ============================================================================
+// SETUP TIMEOUT
+// ============================================================================
+if bullSetupActive and not na(bullSetupBar) and bar_index - bullSetupBar > setupTimeout
+    bullSetupActive := false
+if bearSetupActive and not na(bearSetupBar) and bar_index - bearSetupBar > setupTimeout
+    bearSetupActive := false
+
+// ============================================================================
+// DASHBOARD
+// ============================================================================
+var table dash = na
+if showTable and barstate.isfirst
+    pos = tablePos == "top_right" ? position.top_right : tablePos == "top_left" ? position.top_left : tablePos == "bottom_right" ? position.bottom_right : position.bottom_left
+    dash := table.new(pos, 2, 8, border_width=1, border_color=color.gray, frame_color=color.gray, frame_width=1)
+
+if showTable and barstate.islast
+    table.cell(dash, 0, 0, "SMC Dashboard", text_color=color.white, bgcolor=color.new(color.blue, 20), text_size=size.small)
+    table.cell(dash, 1, 0, "", bgcolor=color.new(color.blue, 20))
+
+    biasTxt = bullSetupActive and bearSetupActive ? "Bull + Bear Setup" : bullSetupActive ? "Bullish Setup Active" : bearSetupActive ? "Bearish Setup Active" : "Neutral"
+    biasCol = bullSetupActive and not bearSetupActive ? color.new(color.green, 70) : bearSetupActive and not bullSetupActive ? color.new(color.red, 70) : color.new(color.gray, 80)
+    table.cell(dash, 0, 1, "Bias", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 1, biasTxt, bgcolor=biasCol, text_size=size.small)
+
+    table.cell(dash, 0, 2, "Active Bull Zones", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 2, str.tostring(array.size(bullZones)), text_size=size.small)
+
+    table.cell(dash, 0, 3, "Active Bear Zones", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 3, str.tostring(array.size(bearZones)), text_size=size.small)
+
+    table.cell(dash, 0, 4, "Bull Sweeps / Bear Sweeps", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 4, str.tostring(bullSweepCount) + " / " + str.tostring(bearSweepCount), text_size=size.small)
+
+    table.cell(dash, 0, 5, "Buy Signals / Sell Signals", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 5, str.tostring(buyCount) + " / " + str.tostring(sellCount), text_size=size.small)
+
+    lastSigAgo = na(lastSignalBar) ? "N/A" : str.tostring(bar_index - lastSignalBar) + " bars ago"
+    table.cell(dash, 0, 6, "Last Signal", text_color=color.gray, text_size=size.small)
+    lastSigCol = lastSignal == "BUY" ? color.new(color.green, 70) : lastSignal == "SELL" ? color.new(color.red, 70) : color.new(color.gray, 80)
+    table.cell(dash, 1, 6, lastSignal + " (" + lastSigAgo + ")", bgcolor=lastSigCol, text_size=size.small)
+
+    table.cell(dash, 0, 7, "ATR", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 7, str.tostring(atrVal, format.mintick), text_size=size.small)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+alertcondition(bullSweepEvent, title="Bullish Liquidity Sweep", message="Liquidity swept below swing low - bullish setup forming")
+alertcondition(bearSweepEvent, title="Bearish Liquidity Sweep", message="Liquidity swept above swing high - bearish setup forming")
+alertcondition(bullObEvent, title="Bullish Order Block Formed", message="Bullish order block formed after liquidity sweep")
+alertcondition(bearObEvent, title="Bearish Order Block Formed", message="Bearish order block formed after liquidity sweep")
+alertcondition(buySignal, title="BUY Signal", message="BUY: sweep + zone + retest confirmation completed")
+alertcondition(sellSignal, title="SELL Signal", message="SELL: sweep + zone + retest confirmation completed")
