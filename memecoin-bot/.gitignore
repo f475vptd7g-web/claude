@@ -1,0 +1,13 @@
+# Secrets: never commit these
+.env
+
+# Bot data
+state_*.json
+*.tmp
+trades_*.csv
+bot.log
+STOP
+
+__pycache__/
+.venv/
+venv/
